@@ -37,7 +37,7 @@ class Attention(nn.Module):
         self.Wqkv = nn.Linear(d_model, d_model * 3)
         self.Wo = nn.Linear(d_model, d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, output_attentions=False) -> torch.Tensor:
         """
         Args:
             x: (batch_size, seq_len, d_model)
@@ -50,6 +50,12 @@ class Attention(nn.Module):
         d_k = self.d_k
         QKV = self.Wqkv(x).view(B, L, 3, H, d_k).swapaxes(1, 3)  # (B, H, 3, L, d_k)
         Q, K, V = QKV.unbind(2)  # (B, H, L, d_k)
+        if output_attentions:
+            attn_weights = torch.matmul(Q, K.swapaxes(-2, -1)) / (
+                d_k**0.5
+            )  # (B, H, L, L)
+            attn_weights = F.softmax(attn_weights, dim=-1)
+            return attn_weights
         multi_head = F.scaled_dot_product_attention(Q, K, V)  # (B, H, L, d_k)
         multi_head = multi_head.swapaxes(1, 2).flatten(2)  # (B, L, D)
         attention = self.Wo(multi_head)
@@ -69,7 +75,10 @@ class TransformerBlock(nn.Module):
         )
         self.norm_mlp = nn.LayerNorm(d_model, 1e-6)
 
-    def forward(self, x):
+    def forward(self, x, output_attentions=False):
+        if output_attentions:
+            attn_weights = self.attn(self.norm_attn(x), output_attentions=True)
+            return attn_weights
         x = x + self.attn(self.norm_attn(x))
         x = x + self.mlp(self.norm_mlp(x))
         return x
@@ -91,6 +100,8 @@ class ViT(nn.Module):
         assert img_size % patch_size == 0
         num_patches = (img_size // patch_size) ** 2
         num_tokens = 1 + num_patches
+        self.img_size = img_size
+        self.num_classes = num_classes
         self.patch_embed = nn.Conv2d(in_chans, d_model, patch_size, patch_size)
         self.cls_token = nn.Parameter(torch.empty(1, 1, d_model))
         self.pos_embed = nn.Parameter(torch.empty(1, num_tokens, d_model))
@@ -127,11 +138,18 @@ class ViT(nn.Module):
         """
         return x[:, 0]  # cls_token
 
-    def forward_features(self, x):
+    def forward_features(self, x, output_attentions=False):
         x = self.patch_embed(x)  # (B, d_model, H, W)
         x = x.flatten(2).swapaxes(1, 2)  # (B, H*W, d_model)
         x = self.cat_cls(x)
         x = x + self.pos_embed
+        if output_attentions:
+            attn_weights = []
+            for block in self.blocks:
+                attn_weight = block(x, output_attentions=True)
+                attn_weights.append(attn_weight)
+                x = block(x)
+            return torch.stack(attn_weights)
         x = self.blocks(x)
         x = self.norm(x)
         return x
@@ -141,16 +159,22 @@ class ViT(nn.Module):
         logits = self.head(x)
         return logits
 
-    def forward(self, x):
-        x = self.forward_features(x)
+    def forward(self, images, labels=None, output_attentions=False):
+        x = self.forward_features(images, output_attentions=output_attentions)
+        if output_attentions:
+            return x
         x = self.forward_head(x)
+        if labels is not None:
+            loss = F.cross_entropy(x, labels)
+            return loss, x
         return x
 
     def load_timm(self, state_dict):
         new_state_dict = {}
         for k, v in state_dict.items():
             k = (
-                k.replace("patch_embed.proj", "patch_embed")
+                k.replace("timm_model.", "")
+                .replace("patch_embed.proj", "patch_embed")
                 .replace("qkv", "Wqkv")
                 .replace("attn.proj", "attn.Wo")
                 .replace("norm1", "norm_attn")
@@ -158,3 +182,8 @@ class ViT(nn.Module):
             )
             new_state_dict[k] = v
         self.load_state_dict(new_state_dict)
+
+    def freeze(self):
+        for name, param in self.named_parameters():
+            if not name.startswith("head"):
+                param.requires_grad = False
