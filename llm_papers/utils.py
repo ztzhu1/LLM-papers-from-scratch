@@ -1,10 +1,12 @@
+from pathlib import Path
 import random
 
 import numpy as np
 import torch
 from torch.utils.flop_counter import FlopCounterMode
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+project_dir = Path(__file__).parent
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def set_seed(seed: int):
@@ -18,6 +20,8 @@ def set_seed(seed: int):
 
 
 def get_num_params(model):
+    if isinstance(model, torch.nn.Parameter):
+        return model.numel()
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
