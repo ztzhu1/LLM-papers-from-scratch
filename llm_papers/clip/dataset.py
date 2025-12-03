@@ -69,14 +69,19 @@ class COCODataset(Dataset):
         self.dataset = dataset
         self.transform = transform
         self.tokenizer = tokenizer
+        self.indexes = []
+        for img_index, captions in enumerate(dataset["captions"]):
+            for caption_index, caption in enumerate(captions):
+                self.indexes.append((img_index, caption_index))
 
     def __len__(self):
-        return len(self.dataset)
+        return len(self.indexes)
 
     def __getitem__(self, idx):
-        sample = self.dataset[idx]
+        img_idx, caption_index = self.indexes[idx]
+        sample = self.dataset[img_idx]
         image = Image.open(sample["image_path"]).convert("RGB")
-        caption = sample["captions"][0]
+        caption = sample["captions"][caption_index]
 
         if self.transform is not None:
             image = self.transform(image)["pixel_values"][0]
