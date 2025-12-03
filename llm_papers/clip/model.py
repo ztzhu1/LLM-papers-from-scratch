@@ -19,8 +19,7 @@ from transformers import (
     TimmWrapperImageProcessor,
 )
 
-from llm_papers.clip.dataset import CIFARDataset, COCODataset
-from llm_papers.utils import device, project_dir
+from llm_papers.utils import device
 
 # ----- utils -----
 
@@ -48,41 +47,6 @@ def load_pretrained_vit() -> tuple[TimmWrapperImageProcessor, VisionTransformer]
     image_processor = load_image_processor()
     vision_model = timm.create_model("vit_base_patch32_224", pretrained=True).eval()
     return image_processor, vision_model
-
-
-def load_coco2017(
-    transform=None, tokenizer: RobertaTokenizerFast = None, image_path=None
-):
-    dataset = datasets.load_dataset("phiyodr/coco2017")
-    if image_path is None:
-        image_path = project_dir / "clip" / "data" / "coco2017"
-    image_path = Path(image_path)
-
-    def create_full_path(example):
-        example["image_path"] = (image_path / example["file_name"]).as_posix()
-        return example
-
-    dataset = dataset.map(create_full_path, num_proc=4)
-
-    if transform is None:
-        transform = load_image_processor()
-    if tokenizer is None:
-        tokenizer = load_tokenizer()
-
-    train_dataset = COCODataset(dataset["train"], transform, tokenizer)
-    test_dataset = COCODataset(dataset["validation"], transform, tokenizer)
-    return train_dataset, test_dataset
-
-
-def load_cifar100(transform=None, tokenizer: RobertaTokenizerFast = None):
-    if transform is None:
-        transform = load_image_processor()
-    if tokenizer is None:
-        tokenizer = load_tokenizer()
-    dataset = datasets.load_dataset("uoft-cs/cifar100")
-    train_dataset = CIFARDataset(dataset["train"], transform, tokenizer)
-    test_dataset = CIFARDataset(dataset["test"], transform, tokenizer)
-    return train_dataset, test_dataset
 
 
 def long_arange(size):
