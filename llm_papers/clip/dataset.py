@@ -10,9 +10,10 @@ from llm_papers.utils import project_dir
 
 
 def load_cifar100(transform, tokenizer: PreTrainedTokenizerBase):
-    test_dataset = datasets.load_dataset("uoft-cs/cifar100", split="test")
-    test_dataset = CIFARDataset(test_dataset, transform, tokenizer)
-    return test_dataset
+    dataset = datasets.load_dataset("uoft-cs/cifar100")
+    train_dataset = CIFARDataset(dataset['train'], transform, tokenizer, train=True)
+    test_dataset = CIFARDataset(dataset['test'], transform, tokenizer, train=False)
+    return train_dataset, test_dataset
 
 
 def load_coco2017(transform, tokenizer: PreTrainedTokenizerBase, image_path=None):
@@ -31,15 +32,16 @@ def load_coco2017(transform, tokenizer: PreTrainedTokenizerBase, image_path=None
 
 
 class CIFARDataset(Dataset):
-    def __init__(self, dataset: datasets.Dataset, transform, tokenizer):
+    def __init__(self, dataset: datasets.Dataset, transform, tokenizer, train=False):
         self.dataset = dataset
         self.transform = transform
         self.tokenizer = tokenizer
+        self.train=train
         self.label_names = dataset.features["fine_label"].names
         self.captions = [f"a photo of a {label}" for label in self.label_names]
         self.input_ids = None
         self.attention_mask = None
-        if self.tokenizer is not None:
+        if self.tokenizer is not None and not train:
             encoding = self.tokenizer(
                 self.captions,
                 return_tensors="pt",
@@ -61,6 +63,11 @@ class CIFARDataset(Dataset):
         if self.transform is not None:
             pixel_values = self.transform(pixel_values)["pixel_values"][0]
         data = {"pixel_values": pixel_values, "labels": label}
+        if self.train:
+            caption = f"a photo of a {self.label_names[sample['fine_label']]}"
+            encoding = self.tokenizer(caption, return_tensors="pt", truncation=True)
+            data["input_ids"] = encoding["input_ids"][0]
+            data["attention_mask"] = encoding["attention_mask"][0]
         return data
 
 
@@ -69,25 +76,20 @@ class COCODataset(Dataset):
         self.dataset = dataset
         self.transform = transform
         self.tokenizer = tokenizer
-        self.indexes = []
-        for img_index, captions in enumerate(dataset["captions"]):
-            for caption_index, caption in enumerate(captions):
-                self.indexes.append((img_index, caption_index))
 
     def __len__(self):
-        return len(self.indexes)
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        img_idx, caption_index = self.indexes[idx]
-        sample = self.dataset[img_idx]
+        sample = self.dataset[idx]
         image = Image.open(sample["image_path"]).convert("RGB")
-        caption = sample["captions"][caption_index]
+        caption = sample["captions"][0]
 
         if self.transform is not None:
             image = self.transform(image)["pixel_values"][0]
-        result = {"pixel_values": image}
+        data = {"pixel_values": image}
         if self.tokenizer is not None:
             encoding = self.tokenizer(caption, return_tensors="pt", truncation=True)
-            result["input_ids"] = encoding["input_ids"][0]
-            result["attention_mask"] = encoding["attention_mask"][0]
-        return result
+            data["input_ids"] = encoding["input_ids"][0]
+            data["attention_mask"] = encoding["attention_mask"][0]
+        return data
