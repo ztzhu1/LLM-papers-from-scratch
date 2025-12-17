@@ -4,12 +4,16 @@ import re
 from typing import Tuple
 
 from diffusers import StableDiffusionPipeline
+from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
+from diffusers.schedulers.scheduling_pndm import PNDMScheduler
 import einops
 import torch
 from torch import nn
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 from transformers.activations import QuickGELUActivation
+from transformers.models.clip import CLIPTokenizer
 from transformers.models.clip.modeling_clip import CLIPTextTransformer
 
 
@@ -31,15 +35,15 @@ class Attention(nn.Module):
         else:
             self.dropout = None
 
-    def forward(self, x, x_cross=None):
+    def forward(self, x, x_encoder=None):
         ndim = x.ndim
         if ndim == 4:
             height, width = x.shape[2], x.shape[3]
             x = einops.rearrange(x, "B C H W -> B (H W) C")
-        if x_cross is None:
-            x_cross = x
-        elif x_cross.ndim == 4:
-            x_cross = einops.rearrange(x_cross, "B C H W -> B (H W) C")
+        if x_encoder is None:
+            x_encoder = x
+        elif x_encoder.ndim == 4:
+            x_encoder = einops.rearrange(x_encoder, "B C H W -> B (H W) C")
 
         h = self.config.num_heads
         d_k = self.d_model // h
@@ -48,10 +52,10 @@ class Attention(nn.Module):
             self.Wq(x), "B L (head d_k) -> B head L d_k", head=h, d_k=d_k
         )
         K = einops.rearrange(
-            self.Wk(x_cross), "B L (head d_k) -> B head L d_k", head=h, d_k=d_k
+            self.Wk(x_encoder), "B L (head d_k) -> B head L d_k", head=h, d_k=d_k
         )
         V = einops.rearrange(
-            self.Wv(x_cross), "B L (head d_k) -> B head L d_k", head=h, d_k=d_k
+            self.Wv(x_encoder), "B L (head d_k) -> B head L d_k", head=h, d_k=d_k
         )
         x = F.scaled_dot_product_attention(Q, K, V, is_causal=self.is_causal)
         x = einops.rearrange(x, "B head L d_k -> B L (head d_k)")
@@ -81,6 +85,7 @@ class VAEConfig:
     norm_num_groups: int = 32
     eps: float = 1e-6
     dropout: float = 0.0
+    scaling_factor: float = 0.18215
 
     def __post_init__(self):
         self.block_channels = self.block_out_channels[0]
@@ -133,7 +138,7 @@ class ResNet(nn.Module):
         return x0 + self.forward_proj(self.norm1(x), emb)
 
 
-class VAETransformerBlock(nn.Module):
+class AttentionBlock(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -217,7 +222,7 @@ class MidBlock(nn.Module):
         super().__init__()
         self.config = config
         self.blocks = nn.Sequential(
-            *[VAETransformerBlock(config) for _ in range(config.num_layers)]
+            *[AttentionBlock(config) for _ in range(config.num_layers)]
         )
         self.resnet = ResNet(config, config.d_model, config.d_model)
 
@@ -587,10 +592,18 @@ class TimeEmbedding(nn.Module):
         self.freqs = freqs
 
     def forward(self, t):
-        freqs = self.freqs.to(t.device)
+        device = next(self.parameters()).device
+        if not torch.is_tensor(t) or t.ndim == 0:
+            if isinstance(t, float):
+                dtype = torch.float32
+            else:
+                dtype = torch.int32
+            t = torch.tensor([t], dtype=dtype, device=device)
+
+        freqs = self.freqs.to(device)
         phi = t[:, None].float() * freqs[None, :]
         emb = torch.cat([torch.cos(phi), torch.sin(phi)], dim=-1)
-        emb = emb.to(self.fc1.weight.device, self.fc1.weight.dtype)
+        emb = emb.to(device, next(self.parameters()).dtype)
         emb = self.fc1(emb)
         emb = self.act(emb)
         emb = self.fc2(emb)
@@ -637,15 +650,15 @@ class UNetTransformerBlock(nn.Module):
         self.ff = UNetFF(d_model, config.d_ff_ratio * d_model)
         self.proj_out = nn.Conv2d(d_model, d_model, 1, 1, 0)
 
-    def forward(self, x, x_cross=None):
+    def forward(self, x, x_encoder=None):
         if not self.cross_attn:
-            assert x_cross is None
+            assert x_encoder is None
         B, C, H, W = x.shape
         x0 = x
         x = self.proj_in(self.norm_in(x))
         x = einops.rearrange(x, "B C H W -> B (H W) C")
         x = x + self.attn(self.norm_attn1(x))
-        x = x + self.cross_attn(self.norm_attn2(x), x_cross)
+        x = x + self.cross_attn(self.norm_attn2(x), x_encoder)
         x = x + self.ff(self.norm_ff(x))
         x = einops.rearrange(x, "B (H W) C -> B C H W", H=H, W=W)
         x = x0 + self.proj_out(x)
@@ -684,11 +697,11 @@ class UnetDownBlock(nn.Module):
         if down_sampling:
             self.downsampler = DownSampler(out_channels, out_channels, config.padding)
 
-    def forward(self, x, emb, x_cross=None):
+    def forward(self, x, emb, x_encoder=None):
         for i in range(len(self.resnets)):
             x = self.resnets[i](x, emb)
             if self.transformer_blocks is not None:
-                x = self.transformer_blocks[i](x, x_cross)
+                x = self.transformer_blocks[i](x, x_encoder)
             self.res_buf.append(x)
 
         if self.downsampler is not None:
@@ -719,10 +732,10 @@ class UnetMidBlock(nn.Module):
             )
         self.resnets.append(ResNet(config, out_channels, out_channels, emb_channels))
 
-    def forward(self, x, emb, x_cross=None):
+    def forward(self, x, emb, x_encoder=None):
         for i in range(len(self.transformer_blocks)):
             x = self.resnets[i](x, emb)
-            x = self.transformer_blocks[i](x, x_cross)
+            x = self.transformer_blocks[i](x, x_encoder)
         x = self.resnets[-1](x, emb)
 
         return x
@@ -762,13 +775,13 @@ class UnetUpBlock(nn.Module):
         if up_sampling:
             self.upsampler = UpSampler(out_channels, out_channels)
 
-    def forward(self, x, emb, x_cross=None):
+    def forward(self, x, emb, x_encoder=None):
         for i in range(len(self.resnets)):
             res = self.res_buf.pop(-1)
             x = torch.cat([x, res], dim=1)
             x = self.resnets[i](x, emb)
             if self.transformer_blocks is not None:
-                x = self.transformer_blocks[i](x, x_cross)
+                x = self.transformer_blocks[i](x, x_encoder)
 
         if self.upsampler is not None:
             x = self.upsampler(x)
@@ -841,16 +854,16 @@ class UNet(nn.Module):
             self.up_blocks.append(block)
             res_channels = res_channels[: -config.up_layer_resnets]
 
-    def forward(self, x, t, x_cross):
+    def forward(self, x, t, x_encoder):
         self.clean_res_buf()
         emb = self.time_embedding(t)
         x = self.conv_in(x)
         self.res_buf.append(x)
         for down_block in self.down_blocks:
-            x = down_block(x, emb, x_cross)
-        x = self.mid_block(x, emb, x_cross)
+            x = down_block(x, emb, x_encoder)
+        x = self.mid_block(x, emb, x_encoder)
         for up_block in self.up_blocks:
-            x = up_block(x, emb, x_cross)
+            x = up_block(x, emb, x_encoder)
         x = self.norm(x)
         x = self.act(x)
         x = self.conv_out(x)
@@ -860,26 +873,6 @@ class UNet(nn.Module):
         while len(self.res_buf) > 0:
             res = self.res_buf.pop()
             del res
-
-    # def load(self, unet: UNet2DConditionModel):
-    #     state_dict = unet.state_dict()
-    #     new_state_dict = {}
-    #     for k, v in state_dict.items():
-    #         k = (
-    #             k.replace("time_embedding.linear_1", "time_embedding.fc1")
-    #             .replace("time_embedding.linear_2", "time_embedding.fc2")
-    #             .replace("downsamplers.0", "downsampler")
-    #             .replace("upsamplers.0", "upsampler")
-    #         )
-    #         if (
-    #             "time_embedding" not in k
-    #             and "conv_in" not in k
-    #             and "down_blocks" not in k
-    #         ):
-    #             continue
-
-    #         new_state_dict[k] = v
-    #     self.load_state_dict(new_state_dict, 1)
 
     def load(self, unet: UNet2DConditionModel):
         state_dict = unet.state_dict()
@@ -1000,20 +993,101 @@ class UNet(nn.Module):
 class StableDiffusion(nn.Module):
     def __init__(
         self,
+        tokenizer: CLIPTokenizer,
+        scheduler: PNDMScheduler,
         vae_config: VAEConfig = None,
         clip_config: CLIPConfig = None,
         unet_config: UNetConfig = None,
     ):
         super().__init__()
+        self.scheduler = scheduler
+        self.tokenizer = tokenizer
         self.vae_config = vae_config or VAEConfig()
         self.clip_config = clip_config or CLIPConfig()
         self.unet_config = unet_config or UNetConfig()
         self.vae = VAE(self.vae_config)
         self.text_encoder = CLIPTextEncoder(self.clip_config)
         self.unet = UNet(self.unet_config)
+        self.vae_scale_factor = 1
+        for upblock in self.unet.up_blocks:
+            if upblock.upsampler is not None:
+                self.vae_scale_factor *= 2
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
 
-    def forward(self, pixel_values, sample=False):
-        pass
+    @property
+    def device(self):
+        return next(self.parameters()).device
+
+    @property
+    def dtype(self):
+        return next(self.parameters()).dtype
+
+    def encode_text(self, text):
+        input_ids = self.tokenizer(
+            text,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).input_ids
+        embs = self.text_encoder(input_ids.to(self.device))
+        embs = embs.to(self.device, self.dtype)
+        return embs
+
+    def encode_prompt(self, prompts, negative_prompts=None):
+        if negative_prompts is None:
+            negative_prompts = ""
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        if isinstance(negative_prompts, str):
+            negative_prompts = [negative_prompts]
+        assert len(prompts) == len(negative_prompts)
+
+        prompt_embeds = self.encode_text(prompts)
+        negative_prompt_embeds = self.encode_text(negative_prompts)
+        return prompt_embeds, negative_prompt_embeds
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        prompts,
+        height=512,
+        width=512,
+        num_steps=50,
+        negative_prompts=None,
+        guidance_scale=7.5,
+    ):
+        device = self.device
+        dtype = self.dtype
+
+        # ----- embed prompts -----
+        prompt_embeds, neg_prompt_embeds = self.encode_prompt(prompts, negative_prompts)
+        batch_size = prompt_embeds.shape[0]
+        prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds])
+
+        # ----- sample latents -----
+        latent_height = height // self.vae_scale_factor
+        latent_width = width // self.vae_scale_factor
+        latent_channels = self.vae_config.latent_channels
+        latent_shape = (batch_size, latent_channels, latent_height, latent_width)
+        latents = torch.randn(latent_shape, device=device, dtype=dtype)
+
+        # ----- prepare time steps -----
+        self.scheduler.set_timesteps(num_steps, device=device)
+        ts = self.scheduler.timesteps
+
+        # ----- denoise -----
+        for i, t in enumerate(tqdm(ts)):
+            eps_pred = self.unet(latents.repeat(2, 1, 1, 1), t, prompt_embeds)
+            eps_uncond, eps_cond = eps_pred.chunk(2)
+            eps_pred = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+
+            latents = self.scheduler.step(eps_pred, t, latents, return_dict=False)[0]
+
+        images = self.vae.decode(latents / self.vae.config.scaling_factor)
+        images = self.image_processor.postprocess(
+            images, output_type="pil", do_denormalize=[True] * batch_size
+        )
+        return images
 
     def load(self, sd_pipeline: StableDiffusionPipeline):
         self.vae.load(sd_pipeline.vae)
