@@ -6,7 +6,7 @@ from typing import Tuple
 from diffusers import StableDiffusionPipeline
 from diffusers.image_processor import VaeImageProcessor
 from diffusers.models import AutoencoderKL, UNet2DConditionModel
-from diffusers.schedulers.scheduling_pndm import PNDMScheduler
+from diffusers.schedulers import KarrasDiffusionSchedulers
 import einops
 import torch
 from torch import nn
@@ -994,7 +994,7 @@ class StableDiffusion(nn.Module):
     def __init__(
         self,
         tokenizer: CLIPTokenizer,
-        scheduler: PNDMScheduler,
+        scheduler: KarrasDiffusionSchedulers,
         vae_config: VAEConfig = None,
         clip_config: CLIPConfig = None,
         unet_config: UNetConfig = None,
@@ -1039,7 +1039,7 @@ class StableDiffusion(nn.Module):
         if isinstance(prompts, str):
             prompts = [prompts]
         if isinstance(negative_prompts, str):
-            negative_prompts = [negative_prompts]
+            negative_prompts = [negative_prompts] * len(prompts)
         assert len(prompts) == len(negative_prompts)
 
         prompt_embeds = self.encode_text(prompts)
