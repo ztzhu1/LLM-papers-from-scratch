@@ -19,10 +19,16 @@ def set_seed(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
-def get_num_params(model):
-    if isinstance(model, torch.nn.Parameter):
-        return model.numel()
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+def get_num_params(*models):
+    if len(models) == 1:
+        model = models[0]
+        if isinstance(model, torch.nn.Parameter):
+            return model.numel() if model.requires_grad else 0
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = 0
+    for model in models:
+        total_params += get_num_params(model)
+    return total_params
 
 
 def get_flops(model, inputs, with_backward=False):
