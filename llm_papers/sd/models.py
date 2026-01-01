@@ -1000,8 +1000,8 @@ class StableDiffusion(nn.Module):
         unet_config: UNetConfig = None,
     ):
         super().__init__()
-        self.scheduler = scheduler
         self.tokenizer = tokenizer
+        self.scheduler = scheduler
         self.vae_config = vae_config or VAEConfig()
         self.clip_config = clip_config or CLIPConfig()
         self.unet_config = unet_config or UNetConfig()
